@@ -4,7 +4,10 @@ schedule==1.2.2
 pandas==2.0.3
 scikit-learn==1.5.1
 joblib==1.4.2
-coremltools==7.0  # Newer version, less likely to need apt
+coremltools==6.3.0  # Older version that's compatible with Python 3.11
+importlib-metadata==6.8.0  # Required for some dependencies
+setuptools==65.5.1  # Required for coremltools
+wheel==0.41.2  # Required for building packages
 numpy==1.26.4
 nltk==3.8.1
 psutil==5.9.8  # For system monitoring metrics

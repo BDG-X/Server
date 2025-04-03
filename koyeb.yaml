@@ -17,6 +17,8 @@ service:
       value: "1"
     - name: KOYEB_STORAGE_PATH
       value: "/var/koyeb/storage"
+    - name: PYTHON_VERSION
+      value: "3.11.11"
   volume:
     type: persistent
     mount_path: /var/koyeb/storage
@@ -29,6 +31,9 @@ service:
     timeout_seconds: 5
     interval_seconds: 30
     initial_delay_seconds: 10
+  build:
+    runtime: python
+    version: "3.11"  # Make sure Python 3.11 is used
   dockerfile:
     path: .
-    entrypoint: "gunicorn --bind 0.0.0.0:8000 --workers 2 --threads 2 --timeout 60 app:app"
+    entrypoint: "pip install -r requirements.txt && gunicorn --bind 0.0.0.0:8000 --workers 2 --threads 2 --timeout 60 app:app"

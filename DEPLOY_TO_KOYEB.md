@@ -8,6 +8,17 @@ This guide explains how to deploy the Backdoor AI server to [Koyeb](https://www.
 2. The Backdoor AI repository (this repository)
 3. Git installed on your local machine
 
+## Important Note About Python Version
+
+This application requires **Python 3.11.x** specifically due to compatibility requirements with the coremltools library.
+Python version compatibility is enforced through:
+
+- `runtime.txt` - Specifies Python 3.11.11
+- `Dockerfile` - Uses Python 3.11.11-slim as the base image
+- `koyeb.yaml` - Runtime configuration specifies Python 3.11
+
+Using a different Python version will likely result in dependency errors related to the `imp` module.
+
 ## Deployment Options
 
 There are two ways to deploy to Koyeb:
