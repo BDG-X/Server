@@ -15,7 +15,11 @@ import logging
 import nltk
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
-from utils.db_helpers import update_model_incorporation_status, get_pending_uploaded_models
+from utils.db_helpers import (
+    update_model_incorporation_status, 
+    get_pending_uploaded_models,
+    update_training_job_status
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +100,62 @@ def trigger_retraining(db_path):
     except Exception as e:
         logger.error(f"Error during triggered retraining: {str(e)}")
 
+def trigger_retraining_job(db_path, job_id, source_type=None, source_id=None, additional_data=None):
+    """
+    Trigger a model retraining process with job tracking
+    """
+    try:
+        logger.info(f"Starting training job {job_id}")
+        # Update job status to processing
+        update_training_job_status(db_path, job_id, 'processing')
+        
+        # Train model with progress tracking
+        result_version = train_new_model(db_path, job_id=job_id, source_type=source_type, 
+                                      source_id=source_id, additional_data=additional_data)
+        
+        # Update job as completed with the result model version
+        update_training_job_status(db_path, job_id, 'completed', progress=1.0, model_version=result_version)
+        
+        logger.info(f"Training job {job_id} completed successfully with model version {result_version}")
+        return result_version
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Error during training job {job_id}: {error_msg}")
+        
+        # Update job as failed with error message
+        update_training_job_status(db_path, job_id, 'failed', error_message=error_msg)
+        return None
+
+def load_json_training_data(data_path):
+    """
+    Load and validate JSON training data
+    """
+    try:
+        with open(data_path, 'r') as f:
+            data = json.load(f)
+        
+        if 'interactions' not in data:
+            raise ValueError("Invalid training data format: 'interactions' field missing")
+        
+        # Validate data format
+        required_fields = ['deviceId', 'appVersion']
+        for field in required_fields:
+            if field not in data:
+                raise ValueError(f"Invalid training data format: '{field}' field missing")
+        
+        # Validate interactions
+        interaction_fields = ['id', 'userMessage', 'aiResponse', 'detectedIntent', 'confidenceScore']
+        for interaction in data['interactions']:
+            for field in interaction_fields:
+                if field not in interaction:
+                    raise ValueError(f"Invalid interaction format: '{field}' field missing")
+        
+        return data
+    except json.JSONDecodeError:
+        raise ValueError("Invalid JSON format")
+    except Exception as e:
+        raise ValueError(f"Error loading training data: {str(e)}")
+
 def convert_uploaded_coreml_to_sklearn(model_path):
     """
     Convert an uploaded CoreML model back to a scikit-learn compatible model
@@ -124,8 +184,63 @@ def convert_uploaded_coreml_to_sklearn(model_path):
         logger.error(f"Error converting uploaded CoreML model: {str(e)}")
         return None, None, []
 
-def train_new_model(db_path):
+def train_new_model(db_path, job_id=None, source_type=None, source_id=None, additional_data=None):
+    """
+    Train a new model with optional job tracking
+    
+    Parameters:
+    - job_id: ID of the training job if this is part of a tracked job
+    - source_type: 'uploaded_model', 'json_data', or 'combined'
+    - source_id: ID of the source model or data
+    - additional_data: Any additional data needed for training
+    """
     logger.info("Starting model training process")
+    
+    # Update job progress if job_id is provided
+    if job_id:
+        update_training_job_status(db_path, job_id, None, progress=0.05)
+    
+    # Handle specific source types if provided
+    additional_interactions = []
+    if source_type == 'json_data' and source_id:
+        try:
+            # Get the path to the JSON data from the database
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT data_path FROM training_data WHERE id = ?", (source_id,))
+            data_record = cursor.fetchone()
+            conn.close()
+            
+            if data_record and data_record['data_path']:
+                # Load and validate the JSON data
+                json_data = load_json_training_data(data_record['data_path'])
+                
+                # Process the data and add to additional_interactions
+                if 'interactions' in json_data:
+                    additional_interactions = json_data['interactions']
+                    
+                    # Convert field names to match database format
+                    for interaction in additional_interactions:
+                        if 'userMessage' in interaction:
+                            interaction['user_message'] = interaction.pop('userMessage')
+                        if 'aiResponse' in interaction:
+                            interaction['ai_response'] = interaction.pop('aiResponse')
+                        if 'detectedIntent' in interaction:
+                            interaction['detected_intent'] = interaction.pop('detectedIntent')
+                        if 'confidenceScore' in interaction:
+                            interaction['confidence_score'] = interaction.pop('confidenceScore')
+                    
+                    logger.info(f"Loaded {len(additional_interactions)} additional interactions from JSON data")
+                    
+                    # Update job progress
+                    if job_id:
+                        update_training_job_status(db_path, job_id, None, progress=0.1)
+        except Exception as e:
+            logger.error(f"Error processing JSON training data: {str(e)}")
+            # Continue with training using existing data
+    
+    # Load interactions from database
     conn = sqlite3.connect(db_path)
     query = """
         SELECT i.*, f.rating, f.comment 
@@ -134,7 +249,17 @@ def train_new_model(db_path):
     """
     df = pd.read_sql_query(query, conn)
     conn.close()
-    logger.info(f"Loaded {len(df)} interactions for training")
+    logger.info(f"Loaded {len(df)} interactions from database")
+    
+    # Add additional interactions if available
+    if additional_interactions:
+        additional_df = pd.DataFrame(additional_interactions)
+        df = pd.concat([df, additional_df], ignore_index=True)
+        logger.info(f"Combined database with {len(additional_interactions)} additional interactions, total: {len(df)}")
+    
+    # Update job progress
+    if job_id:
+        update_training_job_status(db_path, job_id, None, progress=0.15)
     
     if len(df) < 50:
         logger.warning("Not enough data for training. Need at least 50 interactions.")
@@ -148,6 +273,10 @@ def train_new_model(db_path):
     
     logger.info("Preprocessing text data")
     df['processed_message'] = df['user_message'].apply(preprocess_text)
+    
+    # Update job progress
+    if job_id:
+        update_training_job_status(db_path, job_id, None, progress=0.2)
     
     X = df['processed_message']
     y = df['detected_intent']
@@ -165,13 +294,45 @@ def train_new_model(db_path):
     X_train_vec = vectorizer.fit_transform(X_train)
     X_test_vec = vectorizer.transform(X_test)
     
+    # Update job progress
+    if job_id:
+        update_training_job_status(db_path, job_id, None, progress=0.3)
+    
     # Get uploaded models to incorporate into ensemble
-    uploaded_models = get_pending_uploaded_models(db_path)
+    models_to_process = []
+    
+    # If we have a specific model to use, prioritize it
+    if source_type == 'uploaded_model' and source_id:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM uploaded_models WHERE id = ?", (source_id,))
+        specific_model = cursor.fetchone()
+        conn.close()
+        
+        if specific_model:
+            models_to_process = [dict(specific_model)]
+    
+    # Also get other pending models
+    other_models = get_pending_uploaded_models(db_path)
+    
+    # Remove duplicate models if specific model already included
+    if models_to_process and other_models:
+        specific_model_id = models_to_process[0]['id']
+        other_models = [m for m in other_models if m['id'] != specific_model_id]
+    
+    # Combine models
+    models_to_process.extend(other_models)
+    
     usable_uploaded_models = []
     user_models_info = []
     
+    # Update job progress and prepare for iterative processing
+    model_progress_step = 0.4 / max(len(models_to_process), 1)
+    current_progress = 0.3
+    
     # Process each uploaded model
-    for uploaded_model in uploaded_models:
+    for uploaded_model in models_to_process:
         model_id = uploaded_model['id']
         try:
             # Update status to processing
@@ -210,11 +371,20 @@ def train_new_model(db_path):
         except Exception as e:
             logger.error(f"Error processing uploaded model {model_id}: {str(e)}")
             update_model_incorporation_status(db_path, model_id, 'failed')
+        
+        # Update progress for this model
+        current_progress += model_progress_step
+        if job_id:
+            update_training_job_status(db_path, job_id, None, progress=min(0.7, current_progress))
     
     # Train our base model
     logger.info("Training base RandomForest classifier")
     base_model = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
     base_model.fit(X_train_vec, y_train, sample_weight=w_train)
+    
+    # Update job progress
+    if job_id:
+        update_training_job_status(db_path, job_id, None, progress=0.75)
     
     # Create timestamp for model versioning
     timestamp = int(datetime.now().timestamp())
@@ -346,6 +516,10 @@ def train_new_model(db_path):
         predict_function = predict_intent
         accuracy = base_model.score(X_test_vec, y_test, sample_weight=w_test)
     
+    # Update job progress
+    if job_id:
+        update_training_job_status(db_path, job_id, None, progress=0.85)
+    
     # Save the sklearn model
     sklearn_path = os.path.join(MODEL_DIR, f"intent_classifier_{model_version}.joblib")
     joblib.dump((vectorizer, base_model), sklearn_path)
@@ -371,6 +545,10 @@ def train_new_model(db_path):
             coreml_model.user_defined_metadata['is_ensemble'] = 'true'
             coreml_model.user_defined_metadata['ensemble_size'] = str(len(usable_uploaded_models) + 1)
             coreml_model.user_defined_metadata['intents'] = ','.join(class_labels)
+        
+        # Update job progress
+        if job_id:
+            update_training_job_status(db_path, job_id, None, progress=0.95)
         
         coreml_path = os.path.join(MODEL_DIR, f"model_{model_version}.mlmodel")
         coreml_model.save(coreml_path)
@@ -419,3 +597,21 @@ def get_current_model_version():
             info = json.load(f)
         return info.get('version', '1.0.0')
     return '1.0.0'
+
+def estimate_training_time(data_size, model_count=0):
+    """
+    Estimate training time in minutes based on data size and model count
+    """
+    # Base time based on data size
+    base_minutes = 5
+    
+    # Add time for data size
+    if data_size > 10000:  # 10k records
+        base_minutes += 10
+    elif data_size > 5000:  # 5k records
+        base_minutes += 5
+    
+    # Add time for model count (each model adds processing time)
+    model_minutes = model_count * 2
+    
+    return base_minutes + model_minutes
