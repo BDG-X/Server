@@ -11,16 +11,36 @@ import logging
 import subprocess
 import nltk
 import stat  # Added for permission debugging
-from utils.db_helpers import (
-    init_db, 
-    store_interactions, 
-    store_uploaded_model,
-    store_training_data,
-    create_training_job,
-    update_training_job_status,
-    get_training_job,
-    get_device_training_jobs
-)
+import sys  # For detailed error reporting
+
+# Configure error and exception handling
+import traceback
+def handle_exception(exc_type, exc_value, exc_traceback):
+    # Log the exception details to stderr and the log file
+    logger = logging.getLogger()
+    logger.error("Uncaught exception", exc_info=(exc_type, exc_value, exc_traceback))
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+# Set global exception handler
+sys.excepthook = handle_exception
+
+# Import database helpers with proper error handling
+try:
+    from utils.db_helpers import (
+        init_db, 
+        store_interactions, 
+        store_uploaded_model,
+        store_training_data,
+        create_training_job,
+        update_training_job_status,
+        get_training_job,
+        get_device_training_jobs
+    )
+    logging.info("Successfully imported database helpers")
+except ImportError as e:
+    logging.critical(f"Failed to import database helpers: {e}")
+    # Continue without raising to allow app to partially initialize for diagnostics
+    traceback.print_exc()
 
 # Configure logging
 logging.basicConfig(
@@ -47,10 +67,31 @@ TRAINING_DATA_DIR = os.path.join(BASE_DIR, "training_data")
 # Create a thread lock for database operations
 db_lock = threading.RLock()
 
-# Ensure directories exist
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-os.makedirs(MODEL_DIR, exist_ok=True)
-os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
+# Ensure directories exist with proper error handling
+try:
+    for path in [os.path.dirname(DB_PATH), MODEL_DIR, TRAINING_DATA_DIR]:
+        os.makedirs(path, exist_ok=True)
+        if not os.path.exists(path):
+            logger.critical(f"Failed to create directory: {path}")
+        else:
+            logger.info(f"Directory exists: {path}")
+            # Check if it's writable
+            if os.access(path, os.W_OK):
+                logger.info(f"Directory is writable: {path}")
+                # Try to write a test file
+                try:
+                    test_file = os.path.join(path, ".test_write")
+                    with open(test_file, 'w') as f:
+                        f.write("test")
+                    os.remove(test_file)
+                    logger.info(f"Successfully wrote test file in {path}")
+                except Exception as e:
+                    logger.error(f"Failed to write test file in {path}: {e}")
+            else:
+                logger.critical(f"Directory not writable: {path}")
+except Exception as e:
+    logger.critical(f"Error ensuring directories exist: {e}")
+    logger.critical(traceback.format_exc())
 
 # Debug: Check permissions of the base directory
 def check_permissions(path):
@@ -88,8 +129,16 @@ CORS(app)
 PORT = int(os.getenv("PORT", 8000))
 logger.info(f"Server will run on port {PORT}")
 
-# Initialize database
-init_db(DB_PATH)
+# Initialize database with proper error handling
+try:
+    logger.info(f"Initializing database at {DB_PATH}")
+    init_db(DB_PATH)
+    logger.info("Database initialization successful")
+except Exception as e:
+    logger.critical(f"Database initialization failed: {e}")
+    logger.critical(traceback.format_exc())
+    # Continue execution to allow other endpoints to function
+    # This allows the health check endpoint to report the actual error
 
 @app.route('/api/ai/learn', methods=['POST'])
 def collect_data():
@@ -1309,34 +1358,74 @@ def cleanup_old_data():
         logger.error(f"Error in data cleanup job: {str(e)}")
 
 def run_scheduler():
-    # Schedule model training (early morning)
-    schedule.every().day.at("02:00").do(train_model_job)
+    """Run scheduled tasks with robust error handling"""
+    logger.info("Initializing scheduler")
     
-    # Schedule cleanup job (late night)
-    schedule.every().day.at("03:30").do(cleanup_old_data)
-    
-    # Schedule disk space check (every 6 hours)
-    def check_disk_space():
+    try:
+        # Schedule model training (early morning)
+        schedule.every().day.at("02:00").do(train_model_job)
+        logger.info("Scheduled daily model training for 02:00")
+        
+        # Schedule cleanup job (late night)
+        schedule.every().day.at("03:30").do(cleanup_old_data)
+        logger.info("Scheduled daily cleanup for 03:30")
+        
+        # Schedule disk space check (every 6 hours)
+        def check_disk_space():
+            try:
+                import shutil
+                disk_usage = shutil.disk_usage(BASE_DIR)
+                percent_free = (disk_usage.free / disk_usage.total) * 100
+                logger.info(f"Disk space check: {percent_free:.1f}% free ({disk_usage.free / (1024*1024*1024):.2f} GB)")
+                if percent_free < 10:
+                    logger.warning(f"Low disk space: {percent_free:.1f}% free ({disk_usage.free / (1024*1024*1024):.2f} GB)")
+            except Exception as e:
+                logger.error(f"Error checking disk space: {str(e)}")
+        
+        schedule.every(6).hours.do(check_disk_space)
+        logger.info("Scheduled disk space check every 6 hours")
+        
+        # Run initial disk space check
         try:
-            import shutil
-            disk_usage = shutil.disk_usage(BASE_DIR)
-            percent_free = (disk_usage.free / disk_usage.total) * 100
-            if percent_free < 10:
-                logger.warning(f"Low disk space: {percent_free:.1f}% free ({disk_usage.free / (1024*1024*1024):.2f} GB)")
+            check_disk_space()
         except Exception as e:
-            logger.error(f"Error checking disk space: {str(e)}")
+            logger.error(f"Initial disk space check failed: {str(e)}")
+        
+        # Run scheduler loop with error handling
+        logger.info("Starting scheduler loop")
+        while True:
+            try:
+                schedule.run_pending()
+            except Exception as e:
+                logger.error(f"Error in scheduler: {str(e)}")
+                logger.error(traceback.format_exc())
+                # Don't exit the loop, just continue to the next iteration
+            
+            # Sleep with interruption handling
+            try:
+                time.sleep(60)
+            except (KeyboardInterrupt, SystemExit):
+                logger.info("Scheduler shutting down")
+                break
+            except Exception as e:
+                logger.error(f"Error during scheduler sleep: {str(e)}")
+                # Use a shorter sleep if there was an error
+                time.sleep(5)
     
-    schedule.every(6).hours.do(check_disk_space)
-    
-    # Run scheduler loop
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+    except Exception as e:
+        logger.critical(f"Fatal error in scheduler initialization: {str(e)}")
+        logger.critical(traceback.format_exc())
 
-# Start scheduler thread
-scheduler_thread = threading.Thread(target=run_scheduler)
-scheduler_thread.daemon = True
-scheduler_thread.start()
+# Start scheduler thread with error handling
+try:
+    logger.info("Starting scheduler thread")
+    scheduler_thread = threading.Thread(target=run_scheduler, name="SchedulerThread")
+    scheduler_thread.daemon = True
+    scheduler_thread.start()
+    logger.info("Scheduler thread started successfully")
+except Exception as e:
+    logger.critical(f"Failed to start scheduler thread: {str(e)}")
+    logger.critical(traceback.format_exc())
 
 # Log startup event with system info
 logger.info(f"Started scheduler with daily model training at 02:00 and cleanup at 03:30")

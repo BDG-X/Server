@@ -40,5 +40,5 @@ ENV PYTHONPATH="/app:${PYTHONPATH}"
 # Expose port
 EXPOSE 8000
 
-# Command to run the application
-CMD gunicorn --bind 0.0.0.0:$PORT --workers 2 --threads 2 --timeout 60 app:app
+# Command to run the application with diagnostic wrapper script
+CMD ["./start.sh"]
