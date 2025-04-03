@@ -390,7 +390,15 @@ def train_new_model(db_path, job_id=None, source_type=None, source_id=None, addi
     timestamp = int(datetime.now().timestamp())
     model_version = f"1.0.{timestamp}"
     
-    MODEL_DIR = os.path.join(os.getenv("RENDER_DISK_PATH", "/var/data"), "models")
+    # Support both Koyeb and Render environments
+    if os.getenv("KOYEB_STORAGE_PATH"):
+        # Koyeb persistent storage
+        BASE_DIR = os.getenv("KOYEB_STORAGE_PATH", "/var/koyeb/storage")
+    else:
+        # Render persistent storage (or local fallback)
+        BASE_DIR = os.getenv("RENDER_DISK_PATH", "/var/data")
+    
+    MODEL_DIR = os.path.join(BASE_DIR, "models")
     os.makedirs(MODEL_DIR, exist_ok=True)
     
     # Create ensemble model if we have uploaded models
@@ -594,7 +602,15 @@ def get_current_model_version():
     Get the current model version from the latest_model.json file
     with proper error handling and validation
     """
-    MODEL_DIR = os.path.join(os.getenv("RENDER_DISK_PATH", "/var/data"), "models")
+    # Support both Koyeb and Render environments
+    if os.getenv("KOYEB_STORAGE_PATH"):
+        # Koyeb persistent storage
+        BASE_DIR = os.getenv("KOYEB_STORAGE_PATH", "/var/koyeb/storage")
+    else:
+        # Render persistent storage (or local fallback)
+        BASE_DIR = os.getenv("RENDER_DISK_PATH", "/var/data")
+        
+    MODEL_DIR = os.path.join(BASE_DIR, "models")
     info_path = os.path.join(MODEL_DIR, "latest_model.json")
     
     default_version = '1.0.0'

@@ -30,8 +30,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Set the base directory for persistent storage
-BASE_DIR = os.getenv("RENDER_DISK_PATH", "/opt/render/project")
+# Set the base directory for persistent storage (support both Render and Koyeb)
+if os.getenv("KOYEB_STORAGE_PATH"):
+    # Koyeb persistent storage path
+    BASE_DIR = os.getenv("KOYEB_STORAGE_PATH", "/var/koyeb/storage")
+    logger.info(f"Using Koyeb persistent storage at {BASE_DIR}")
+else:
+    # Render persistent storage path (or local fallback)
+    BASE_DIR = os.getenv("RENDER_DISK_PATH", "/opt/render/project")
+    logger.info(f"Using Render persistent storage at {BASE_DIR}")
+
 DB_PATH = os.path.join(BASE_DIR, "data", "interactions.db")
 MODEL_DIR = os.path.join(BASE_DIR, "models")
 TRAINING_DATA_DIR = os.path.join(BASE_DIR, "training_data")
@@ -76,7 +84,11 @@ except Exception as e:
 app = Flask(__name__)
 CORS(app)
 
-PORT = int(os.getenv("PORT", 10000))
+# Get port from environment variable (Koyeb and Render both use PORT)
+PORT = int(os.getenv("PORT", 8000))
+logger.info(f"Server will run on port {PORT}")
+
+# Initialize database
 init_db(DB_PATH)
 
 @app.route('/api/ai/learn', methods=['POST'])
