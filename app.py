@@ -78,12 +78,9 @@ CORS(app)
 
 PORT = int(os.getenv("PORT", 10000))
 init_db(DB_PATH)
-API_KEY = os.getenv("API_KEY", "rnd_2DfFj1QmKeAWcXF5u9Z0oV35kBiN")
 
 @app.route('/api/ai/learn', methods=['POST'])
 def collect_data():
-    if request.headers.get('X-API-Key') != API_KEY:
-        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
     try:
         data = request.json
         logger.info(f"Received learning data from device: {data.get('deviceId', 'unknown')}")
@@ -108,8 +105,6 @@ def collect_data():
 @app.route('/api/ai/upload-model', methods=['POST'])
 def upload_model():
     """Endpoint for uploading user-trained .mlmodel files to be combined with server models."""
-    if request.headers.get('X-API-Key') != API_KEY:
-        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
     
     try:
         # Check if file is included in the request
@@ -180,8 +175,6 @@ def upload_model():
 
 @app.route('/api/ai/models/<version>', methods=['GET'])
 def get_model(version):
-    if request.headers.get('X-API-Key') != API_KEY:
-        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
     
     model_path = os.path.join(MODEL_DIR, f"model_{version}.mlmodel")
     if os.path.exists(model_path):
@@ -211,10 +204,6 @@ def model_services():
     - status: Check training job status
     - download: Download a trained model
     """
-    # Security check: Validate API key
-    api_key = request.headers.get('X-API-Key')
-    if not api_key or api_key != API_KEY:
-        return jsonify({'success': False, 'message': 'Unauthorized - invalid API key'}), 401
     
     # Input validation: Sanitize and validate the operation parameter
     operation = request.args.get('operation', '')
@@ -1111,8 +1100,6 @@ def get_available_model_versions():
 
 @app.route('/api/ai/latest-model', methods=['GET'])
 def latest_model():
-    if request.headers.get('X-API-Key') != API_KEY:
-        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
     model_info = get_latest_model_info()
     return jsonify({
         'success': True,
@@ -1123,9 +1110,6 @@ def latest_model():
 
 @app.route('/api/ai/stats', methods=['GET'])
 def get_stats():
-    admin_key = os.getenv("ADMIN_API_KEY", "rnd_2DfFj1QmKeAWcXF5u9Z0oV35kBiN")
-    if request.headers.get('X-Admin-Key') != admin_key:
-        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
     
     conn = None
     try:
@@ -1363,8 +1347,8 @@ def health_check():
         'metrics': {}
     }
     
-    # Check for admin key to include detailed diagnostics
-    include_details = request.headers.get('X-Admin-Key') == os.getenv("ADMIN_API_KEY")
+    # Always include detailed diagnostics (no key required)
+    include_details = True
     
     try:
         # Get server uptime
@@ -1870,7 +1854,7 @@ def api_documentation():
                 </div>
                 
                 <div class="auth-info">
-                    <strong>Authentication Required:</strong> Header <code>X-API-Key</code> must be provided.
+                    <strong>No Authentication Required:</strong> This endpoint is publicly accessible.
                 </div>
                 
                 <div class="operation-tabs">
@@ -2198,7 +2182,7 @@ def api_documentation():
                 </div>
                 
                 <div class="auth-info">
-                    <strong>Authentication Required:</strong> Header <code>X-API-Key</code> must be provided.
+                    <strong>No Authentication Required:</strong> This endpoint is publicly accessible.
                 </div>
                 
                 <div class="request-example">
@@ -2247,7 +2231,7 @@ def api_documentation():
                 </div>
                 
                 <div class="auth-info">
-                    <strong>Authentication Required:</strong> Header <code>X-API-Key</code> must be provided.
+                    <strong>No Authentication Required:</strong> This endpoint is publicly accessible.
                 </div>
                 
                 <div class="request-example">
@@ -2316,7 +2300,7 @@ def api_documentation():
                 </div>
                 
                 <div class="auth-info">
-                    <strong>Authentication Required:</strong> Header <code>X-API-Key</code> must be provided.
+                    <strong>No Authentication Required:</strong> This endpoint is publicly accessible.
                 </div>
                 
                 <div class="parameters">
@@ -2350,7 +2334,7 @@ def api_documentation():
                 </div>
                 
                 <div class="auth-info">
-                    <strong>Authentication Required:</strong> Header <code>X-API-Key</code> must be provided.
+                    <strong>No Authentication Required:</strong> This endpoint is publicly accessible.
                 </div>
                 
                 <div class="response-example">
@@ -2375,7 +2359,7 @@ def api_documentation():
                 </div>
                 
                 <div class="auth-info">
-                    <strong>Authentication Required:</strong> Header <code>X-Admin-Key</code> must be provided.
+                    <strong>No Authentication Required:</strong> This endpoint is publicly accessible.
                 </div>
                 
                 <div class="response-example">

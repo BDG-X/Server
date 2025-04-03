@@ -6,9 +6,5 @@ services:
     buildCommand: "python -m pip install --upgrade pip && pip install -r requirements.txt"
     startCommand: "python app.py"
     envVars:
-      - key: API_KEY
-        value: "rnd_2DfFj1QmKeAWcXF5u9Z0oV35kBiN"  # Replace with a secure key
-      - key: ADMIN_API_KEY
-        value: "rnd_2DfFj1QmKeAWcXF5u9Z0oV35kBiN"  # Replace with a secure key
       - key: PYTHON_VERSION
         value: "3.11.11"  # Ensure compatibility with coremltools
