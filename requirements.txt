@@ -7,3 +7,8 @@ joblib==1.4.2
 coremltools==7.0  # Newer version, less likely to need apt
 numpy==1.26.4
 nltk==3.8.1
+psutil==5.9.8  # For system monitoring metrics
+pyOpenSSL==24.0.0  # For enhanced security
+gunicorn==21.2.0  # Production-grade WSGI server
+sentry-sdk==1.39.1  # Error tracking (optional)
+healthcheck==1.3.3  # For comprehensive system health checks

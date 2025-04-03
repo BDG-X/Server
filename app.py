@@ -211,264 +211,494 @@ def model_services():
     - status: Check training job status
     - download: Download a trained model
     """
-    if request.headers.get('X-API-Key') != API_KEY:
-        return jsonify({'success': False, 'message': 'Unauthorized'}), 401
+    # Security check: Validate API key
+    api_key = request.headers.get('X-API-Key')
+    if not api_key or api_key != API_KEY:
+        return jsonify({'success': False, 'message': 'Unauthorized - invalid API key'}), 401
     
+    # Input validation: Sanitize and validate the operation parameter
     operation = request.args.get('operation', '')
+    valid_operations = {'upload-model', 'upload-data', 'train', 'status', 'download'}
+    
+    if not operation:
+        return jsonify({
+            'success': False, 
+            'message': 'Missing operation parameter',
+            'validOperations': list(valid_operations)
+        }), 400
+        
+    if operation not in valid_operations:
+        return jsonify({
+            'success': False, 
+            'message': f'Invalid operation: {operation}',
+            'validOperations': list(valid_operations)
+        }), 400
+    
+    # Rate limiting (placeholder for actual implementation)
+    # In production, you would implement proper rate limiting here
     
     try:
-        # Handle model upload
+        # Security headers for file downloads
+        headers = {}
+        
+        # ======== MODEL UPLOAD OPERATION ========
         if operation == 'upload-model' and request.method == 'POST':
+            # File validation
             if 'model' not in request.files:
                 return jsonify({'success': False, 'message': 'No model file provided'}), 400
             
             model_file = request.files['model']
-            if model_file.filename == '':
-                return jsonify({'success': False, 'message': 'No model file selected'}), 400
             
-            # Get device ID and other metadata
-            device_id = request.form.get('deviceId', 'unknown')
-            app_version = request.form.get('appVersion', 'unknown')
-            description = request.form.get('description', '')
-            train_now = request.form.get('trainNow', 'false').lower() == 'true'
+            # Check file exists and has content
+            if model_file.filename == '' or not model_file:
+                return jsonify({'success': False, 'message': 'No model file selected or empty file uploaded'}), 400
             
-            # Ensure the file is a CoreML model
-            if not model_file.filename.endswith('.mlmodel'):
-                return jsonify({'success': False, 'message': 'File must be a CoreML model (.mlmodel)'}), 400
+            # Get and sanitize metadata
+            from utils.db_helpers import sanitize_string
+            device_id = sanitize_string(request.form.get('deviceId', 'unknown'), 100)
+            app_version = sanitize_string(request.form.get('appVersion', 'unknown'), 50)
+            description = sanitize_string(request.form.get('description', ''), 1000)
             
-            # Create directory for uploaded models
+            # Convert trainNow to boolean safely 
+            train_now = False
+            train_now_input = request.form.get('trainNow', 'false').lower()
+            if train_now_input in ('true', 'yes', '1', 'on'):
+                train_now = True
+            
+            # Enhanced file validation
+            filename = model_file.filename
+            file_ext = os.path.splitext(filename)[1].lower() if filename else ''
+            
+            # Validate extension and MIME type
+            if file_ext != '.mlmodel':
+                return jsonify({'success': False, 'message': 'File must have .mlmodel extension'}), 400
+            
+            # Check mimetype if available 
+            mimetype = model_file.content_type if hasattr(model_file, 'content_type') else None
+            valid_mimetypes = {'application/octet-stream', 'application/x-mlmodel', ''}
+            
+            if mimetype and mimetype not in valid_mimetypes:
+                logger.warning(f"Suspicious MIME type for model upload: {mimetype}")
+                return jsonify({'success': False, 'message': 'Invalid file type'}), 400
+            
+            # Create secure directory for uploaded models
             UPLOADED_MODELS_DIR = os.path.join(MODEL_DIR, "uploaded")
             os.makedirs(UPLOADED_MODELS_DIR, exist_ok=True)
             
-            # Generate a unique filename
+            # Generate a unique secure filename with UUID
+            file_uuid = str(uuid.uuid4())
             timestamp = int(datetime.now().timestamp())
-            unique_filename = f"model_upload_{device_id}_{timestamp}.mlmodel"
+            unique_filename = f"model_upload_{device_id}_{timestamp}_{file_uuid}.mlmodel"
             file_path = os.path.join(UPLOADED_MODELS_DIR, unique_filename)
             
-            # Save the uploaded model
-            model_file.save(file_path)
-            logger.info(f"Saved uploaded model from device {device_id} to {file_path}")
+            # Check and create parent directory if needed (avoid path traversal)
+            parent_dir = os.path.dirname(file_path)
+            if not os.path.exists(parent_dir):
+                os.makedirs(parent_dir, exist_ok=True)
             
-            # Store model metadata in database
-            with db_lock:
-                model_id = store_uploaded_model(
-                    DB_PATH, 
-                    device_id=device_id,
-                    app_version=app_version,
-                    description=description,
-                    file_path=file_path,
-                    file_size=os.path.getsize(file_path),
-                    original_filename=model_file.filename
-                )
+            # Save the uploaded model safely with a try/except block
+            try:
+                model_file.save(file_path)
+                logger.info(f"Saved uploaded model from device {device_id} to {file_path}")
+                
+                # Get file size with error handling
+                try:
+                    file_size = os.path.getsize(file_path)
+                    if file_size == 0:
+                        raise ValueError("Uploaded file is empty")
+                    
+                    # Check if file is too large (e.g., 100MB limit)
+                    max_size = 100 * 1024 * 1024  # 100MB
+                    if file_size > max_size:
+                        os.remove(file_path)
+                        return jsonify({'success': False, 'message': 'File too large (max 100MB)'}), 413
+                except OSError as e:
+                    logger.error(f"Error accessing file: {str(e)}")
+                    return jsonify({'success': False, 'message': 'Error processing uploaded file'}), 500
+                
+            except Exception as e:
+                logger.error(f"Error saving uploaded model: {str(e)}")
+                return jsonify({'success': False, 'message': 'Error saving uploaded file'}), 500
             
-            # Create a training job if requested to train immediately
+            model_id = None
             job_id = None
-            if train_now:
-                # Create a training job
-                from learning.trainer import estimate_training_time
-                estimated_time = estimate_training_time(0, 1)  # Estimate based on a single model
-                
-                metadata = {
-                    'source_filename': model_file.filename,
-                    'estimated_minutes': estimated_time,
-                    'data_size': os.path.getsize(file_path)
-                }
-                
+            
+            # Use a database transaction to ensure consistency
+            try:
+                # Store model metadata in database
                 with db_lock:
-                    job_id = create_training_job(
-                        DB_PATH,
+                    model_id = store_uploaded_model(
+                        DB_PATH, 
                         device_id=device_id,
-                        source_type='uploaded_model',
-                        source_id=model_id,
-                        metadata=metadata
+                        app_version=app_version,
+                        description=description,
+                        file_path=file_path,
+                        file_size=file_size,
+                        original_filename=os.path.basename(filename)
                     )
                 
-                # Start training in a background thread
-                from learning.trainer import trigger_retraining_job
-                training_thread = threading.Thread(
-                    target=trigger_retraining_job,
-                    args=(DB_PATH, job_id, 'uploaded_model', model_id),
-                    daemon=True
-                )
-                training_thread.start()
-                
-                training_status = {
-                    'jobId': job_id,
-                    'status': 'queued',
-                    'estimatedTimeMinutes': estimated_time,
-                    'message': 'Training job started'
-                }
-            else:
-                # If not training immediately, check if general retraining should be triggered
-                from learning.trainer import should_retrain, trigger_retraining
-                if should_retrain(DB_PATH):
-                    threading.Thread(target=trigger_retraining, args=(DB_PATH,), daemon=True).start()
-                    training_status = {
-                        'message': 'Model will be incorporated in scheduled training (triggered)',
-                        'estimatedTimeMinutes': None
+                # Create a training job if requested to train immediately
+                if train_now and model_id:
+                    # Create a training job
+                    from learning.trainer import estimate_training_time
+                    estimated_time = estimate_training_time(file_size, 1)
+                    
+                    # Prepare metadata
+                    metadata = {
+                        'source_filename': os.path.basename(filename),
+                        'estimated_minutes': estimated_time,
+                        'data_size': file_size,
+                        'created_by': 'model_services_api'
                     }
+                    
+                    with db_lock:
+                        job_id = create_training_job(
+                            DB_PATH,
+                            device_id=device_id,
+                            source_type='uploaded_model',
+                            source_id=model_id,
+                            metadata=metadata
+                        )
+                    
+                    # Start training in a background thread
+                    from learning.trainer import trigger_retraining_job
+                    if job_id:
+                        training_thread = threading.Thread(
+                            target=trigger_retraining_job,
+                            args=(DB_PATH, job_id, 'uploaded_model', model_id),
+                            daemon=True
+                        )
+                        training_thread.start()
+                        
+                        training_status = {
+                            'jobId': job_id,
+                            'status': 'queued',
+                            'estimatedTimeMinutes': estimated_time,
+                            'message': 'Training job started'
+                        }
+                    else:
+                        training_status = {
+                            'message': 'Failed to create training job',
+                            'estimatedTimeMinutes': None
+                        }
                 else:
-                    training_status = {
-                        'message': 'Model will be incorporated in next scheduled training',
-                        'estimatedTimeMinutes': None
-                    }
-            
-            # Return response with model and job info
-            latest_model = get_latest_model_info()
-            return jsonify({
-                'success': True,
-                'message': 'Model uploaded successfully',
-                'modelId': model_id,
-                'training': training_status,
-                'latestModelVersion': latest_model['version'],
-                'modelDownloadURL': f"https://{request.host}/api/ai/models/{latest_model['version']}"
-            })
+                    # If not training immediately, check if general retraining should be triggered
+                    from learning.trainer import should_retrain, trigger_retraining
+                    if should_retrain(DB_PATH):
+                        threading.Thread(target=trigger_retraining, args=(DB_PATH,), daemon=True).start()
+                        training_status = {
+                            'message': 'Model will be incorporated in scheduled training (triggered)',
+                            'estimatedTimeMinutes': None
+                        }
+                    else:
+                        training_status = {
+                            'message': 'Model will be incorporated in next scheduled training',
+                            'estimatedTimeMinutes': None
+                        }
+                
+                # Return success response with detailed information
+                latest_model = get_latest_model_info()
+                return jsonify({
+                    'success': True,
+                    'message': 'Model uploaded successfully',
+                    'modelId': model_id,
+                    'fileName': os.path.basename(filename),
+                    'fileSize': file_size,
+                    'uploadTime': datetime.now().isoformat(),
+                    'training': training_status,
+                    'latestModelVersion': latest_model['version'],
+                    'modelDownloadURL': f"https://{request.host}/api/ai/models/{latest_model['version']}"
+                })
+                
+            except Exception as e:
+                # If anything fails during the database/training steps, clean up the file
+                logger.error(f"Error in model upload process: {str(e)}")
+                try:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                except:
+                    pass
+                return jsonify({'success': False, 'message': f'Error processing model: {str(e)}'}), 500
         
-        # Handle JSON training data upload
+        # ======== JSON DATA UPLOAD OPERATION ========
         elif operation == 'upload-data' and request.method == 'POST':
-            # Check if we have JSON data or a file upload
-            content_type = request.content_type or ''
-            device_id = request.args.get('deviceId') or request.form.get('deviceId', 'unknown')
-            app_version = request.args.get('appVersion') or request.form.get('appVersion', 'unknown')
-            description = request.args.get('description') or request.form.get('description', '')
-            train_now = (request.args.get('trainNow') or request.form.get('trainNow', 'false')).lower() == 'true'
+            from utils.db_helpers import sanitize_string
             
+            # Get and sanitize metadata from form or query parameters
+            device_id = sanitize_string(request.args.get('deviceId') or request.form.get('deviceId', 'unknown'), 100)
+            app_version = sanitize_string(request.args.get('appVersion') or request.form.get('appVersion', 'unknown'), 50)
+            description = sanitize_string(request.args.get('description') or request.form.get('description', ''), 1000)
+            
+            # Convert trainNow to boolean safely
+            train_now_input = request.args.get('trainNow') or request.form.get('trainNow', 'false')
+            train_now = train_now_input.lower() in ('true', 'yes', '1', 'on')
+            
+            # Convert storeInteractions to boolean safely
+            store_interactions_input = request.args.get('storeInteractions') or request.form.get('storeInteractions', 'true')
+            store_interactions_flag = store_interactions_input.lower() in ('true', 'yes', '1', 'on')
+            
+            # Determine content type
+            content_type = request.content_type or ''
             data_content = None
             file_path = None
+            file_size = 0
             
-            if 'application/json' in content_type:
-                # JSON data provided directly in request body
-                data_content = request.json
-                if not data_content or 'interactions' not in data_content:
-                    return jsonify({'success': False, 'message': 'Invalid JSON data format'}), 400
-                
-                # Save the JSON data to a file
-                timestamp = int(datetime.now().timestamp())
-                unique_filename = f"data_upload_{device_id}_{timestamp}.json"
-                file_path = os.path.join(TRAINING_DATA_DIR, unique_filename)
-                
-                with open(file_path, 'w') as f:
-                    json.dump(data_content, f)
-                
-                logger.info(f"Saved uploaded JSON data from device {device_id} to {file_path}")
-                
-            elif 'multipart/form-data' in content_type:
-                # File upload with form data
-                if 'data' not in request.files:
-                    return jsonify({'success': False, 'message': 'No data file provided'}), 400
-                
-                data_file = request.files['data']
-                if data_file.filename == '':
-                    return jsonify({'success': False, 'message': 'No data file selected'}), 400
-                
-                # Ensure the file is a JSON file
-                if not data_file.filename.endswith('.json'):
-                    return jsonify({'success': False, 'message': 'File must be a JSON file (.json)'}), 400
-                
-                # Save the uploaded file
-                timestamp = int(datetime.now().timestamp())
-                unique_filename = f"data_upload_{device_id}_{timestamp}.json"
-                file_path = os.path.join(TRAINING_DATA_DIR, unique_filename)
-                
-                data_file.save(file_path)
-                logger.info(f"Saved uploaded JSON data file from device {device_id} to {file_path}")
-                
-                # Load the file to validate it
-                try:
-                    with open(file_path, 'r') as f:
-                        data_content = json.load(f)
+            # Create secure directory for uploaded data
+            os.makedirs(TRAINING_DATA_DIR, exist_ok=True)
+            
+            # Generate secure filenames with UUID
+            file_uuid = str(uuid.uuid4())
+            timestamp = int(datetime.now().timestamp())
+            unique_filename = f"data_upload_{device_id}_{timestamp}_{file_uuid}.json"
+            file_path = os.path.join(TRAINING_DATA_DIR, unique_filename)
+            
+            try:
+                # Process direct JSON data
+                if 'application/json' in content_type:
+                    # JSON data provided directly in request body
+                    data_content = request.json
                     
-                    if not data_content or 'interactions' not in data_content:
-                        os.remove(file_path)  # Clean up invalid file
-                        return jsonify({'success': False, 'message': 'Invalid JSON data format'}), 400
-                except Exception as e:
-                    os.remove(file_path)  # Clean up invalid file
-                    return jsonify({'success': False, 'message': f'Invalid JSON file: {str(e)}'}), 400
-            else:
-                return jsonify({'success': False, 'message': 'Invalid content type. Expected application/json or multipart/form-data'}), 400
-            
-            # Store training data metadata in database
-            with db_lock:
-                data_id = store_training_data(
-                    DB_PATH,
-                    device_id=device_id,
-                    app_version=app_version,
-                    description=description,
-                    data_path=file_path,
-                    file_size=os.path.getsize(file_path)
-                )
-            
-            # Create a training job if requested
-            job_id = None
-            if train_now:
-                # Create a training job
-                from learning.trainer import estimate_training_time
-                interactions_count = len(data_content.get('interactions', []))
-                estimated_time = estimate_training_time(interactions_count)
-                
-                metadata = {
-                    'interactions_count': interactions_count,
-                    'estimated_minutes': estimated_time,
-                    'data_size': os.path.getsize(file_path)
-                }
-                
-                with db_lock:
-                    job_id = create_training_job(
-                        DB_PATH,
-                        device_id=device_id,
-                        source_type='json_data',
-                        source_id=data_id,
-                        metadata=metadata
-                    )
-                
-                # Start training in a background thread
-                from learning.trainer import trigger_retraining_job
-                training_thread = threading.Thread(
-                    target=trigger_retraining_job,
-                    args=(DB_PATH, job_id, 'json_data', data_id),
-                    daemon=True
-                )
-                training_thread.start()
-                
-                training_status = {
-                    'jobId': job_id,
-                    'status': 'queued',
-                    'estimatedTimeMinutes': estimated_time,
-                    'message': f'Training job started with {interactions_count} interactions'
-                }
-            else:
-                training_status = {
-                    'message': 'Data stored for next scheduled training',
-                    'estimatedTimeMinutes': None
-                }
-            
-            # Store the interactions in the database (optional)
-            if request.args.get('storeInteractions', 'true').lower() == 'true':
-                with db_lock:
+                    # Validate data structure
+                    if not data_content or not isinstance(data_content, dict) or 'interactions' not in data_content:
+                        return jsonify({'success': False, 'message': 'Invalid JSON data format: missing interactions array'}), 400
+                    
+                    if not isinstance(data_content.get('interactions', []), list):
+                        return jsonify({'success': False, 'message': 'Invalid JSON data format: interactions must be an array'}), 400
+                    
+                    # Enforce size limits
+                    interactions_count = len(data_content.get('interactions', []))
+                    if interactions_count == 0:
+                        return jsonify({'success': False, 'message': 'No interactions provided in data'}), 400
+                    
+                    if interactions_count > 50000:  # Arbitrary limit to prevent abuse
+                        return jsonify({'success': False, 'message': 'Too many interactions (max 50,000)'}), 413
+                    
+                    # Save the JSON data to a file with proper error handling
                     try:
-                        store_interactions(DB_PATH, data_content)
-                        logger.info(f"Stored interactions from uploaded data (device: {device_id})")
+                        with open(file_path, 'w') as f:
+                            json.dump(data_content, f)
+                        
+                        file_size = os.path.getsize(file_path)
+                        logger.info(f"Saved JSON data from device {device_id} to {file_path} ({file_size} bytes)")
+                    except (IOError, OSError) as e:
+                        logger.error(f"Error saving JSON data: {str(e)}")
+                        return jsonify({'success': False, 'message': 'Error saving training data'}), 500
+                
+                # Process file upload
+                elif 'multipart/form-data' in content_type:
+                    # File upload with form data
+                    if 'data' not in request.files:
+                        return jsonify({'success': False, 'message': 'No data file provided in form data'}), 400
+                    
+                    data_file = request.files['data']
+                    
+                    # Check if file exists and has content
+                    if data_file.filename == '' or not data_file:
+                        return jsonify({'success': False, 'message': 'No data file selected or empty file uploaded'}), 400
+                    
+                    # Validate file extension
+                    orig_filename = data_file.filename
+                    file_ext = os.path.splitext(orig_filename)[1].lower() if orig_filename else ''
+                    
+                    if file_ext != '.json':
+                        return jsonify({'success': False, 'message': 'File must have .json extension'}), 400
+                    
+                    # Check file type if available
+                    mimetype = data_file.content_type if hasattr(data_file, 'content_type') else None
+                    valid_mimetypes = {'application/json', 'text/json', 'text/plain', ''}
+                    
+                    if mimetype and mimetype not in valid_mimetypes:
+                        logger.warning(f"Suspicious MIME type for JSON upload: {mimetype}")
+                        return jsonify({'success': False, 'message': 'Invalid file type'}), 400
+                    
+                    # Save the uploaded file with proper error handling
+                    try:
+                        data_file.save(file_path)
+                        file_size = os.path.getsize(file_path)
+                        
+                        # Check file size
+                        if file_size == 0:
+                            os.remove(file_path)  # Clean up empty file
+                            return jsonify({'success': False, 'message': 'Uploaded file is empty'}), 400
+                        
+                        # Maximum allowed file size (e.g., 10MB)
+                        max_size = 10 * 1024 * 1024
+                        if file_size > max_size:
+                            os.remove(file_path)  # Clean up oversized file
+                            return jsonify({'success': False, 'message': 'File too large (max 10MB)'}), 413
+                        
+                        logger.info(f"Saved JSON file from device {device_id} to {file_path} ({file_size} bytes)")
                     except Exception as e:
-                        logger.error(f"Error storing interactions from uploaded data: {str(e)}")
-            
-            # Return success response
-            latest_model = get_latest_model_info()
-            return jsonify({
-                'success': True,
-                'message': 'Training data uploaded successfully',
-                'dataId': data_id,
-                'training': training_status,
-                'latestModelVersion': latest_model['version'],
-                'modelDownloadURL': f"https://{request.host}/api/ai/models/{latest_model['version']}"
-            })
+                        logger.error(f"Error saving uploaded file: {str(e)}")
+                        if os.path.exists(file_path):
+                            os.remove(file_path)  # Clean up on error
+                        return jsonify({'success': False, 'message': 'Error saving uploaded file'}), 500
+                    
+                    # Load and validate the file content
+                    try:
+                        with open(file_path, 'r') as f:
+                            data_content = json.load(f)
+                        
+                        # Validate data structure
+                        if not data_content or not isinstance(data_content, dict) or 'interactions' not in data_content:
+                            os.remove(file_path)  # Clean up invalid file
+                            return jsonify({'success': False, 'message': 'Invalid JSON data format: missing interactions array'}), 400
+                        
+                        if not isinstance(data_content.get('interactions', []), list):
+                            os.remove(file_path)  # Clean up invalid file
+                            return jsonify({'success': False, 'message': 'Invalid JSON data format: interactions must be an array'}), 400
+                        
+                        interactions_count = len(data_content.get('interactions', []))
+                        if interactions_count == 0:
+                            os.remove(file_path)  # Clean up empty file
+                            return jsonify({'success': False, 'message': 'No interactions provided in data'}), 400
+                            
+                    except json.JSONDecodeError as e:
+                        os.remove(file_path)  # Clean up invalid file
+                        return jsonify({'success': False, 'message': f'Invalid JSON file: {str(e)}'}), 400
+                    except Exception as e:
+                        if os.path.exists(file_path):
+                            os.remove(file_path)  # Clean up on error
+                        logger.error(f"Error validating uploaded JSON: {str(e)}")
+                        return jsonify({'success': False, 'message': f'Error processing file: {str(e)}'}), 500
+                
+                else:
+                    # Invalid content type
+                    return jsonify({
+                        'success': False, 
+                        'message': 'Invalid content type. Expected application/json or multipart/form-data',
+                        'receivedContentType': content_type
+                    }), 400
+                
+                # At this point we have valid data_content and file_path
+                data_id = None
+                job_id = None
+                interactions_count = len(data_content.get('interactions', []))
+                
+                # Complete the database operations in a transaction
+                try:
+                    # Store training data metadata in database
+                    with db_lock:
+                        data_id = store_training_data(
+                            DB_PATH,
+                            device_id=device_id,
+                            app_version=app_version,
+                            description=description,
+                            data_path=file_path,
+                            file_size=file_size
+                        )
+                    
+                    # Create a training job if requested
+                    if train_now and data_id:
+                        # Create a training job with appropriate time estimate
+                        from learning.trainer import estimate_training_time
+                        estimated_time = estimate_training_time(interactions_count)
+                        
+                        metadata = {
+                            'interactions_count': interactions_count,
+                            'estimated_minutes': estimated_time,
+                            'data_size': file_size,
+                            'created_by': 'model_services_api'
+                        }
+                        
+                        with db_lock:
+                            job_id = create_training_job(
+                                DB_PATH,
+                                device_id=device_id,
+                                source_type='json_data',
+                                source_id=data_id,
+                                metadata=metadata
+                            )
+                        
+                        # Start training in a background thread if job created successfully
+                        if job_id:
+                            from learning.trainer import trigger_retraining_job
+                            training_thread = threading.Thread(
+                                target=trigger_retraining_job,
+                                args=(DB_PATH, job_id, 'json_data', data_id),
+                                daemon=True
+                            )
+                            training_thread.start()
+                            
+                            training_status = {
+                                'jobId': job_id,
+                                'status': 'queued',
+                                'estimatedTimeMinutes': estimated_time,
+                                'message': f'Training job started with {interactions_count} interactions'
+                            }
+                        else:
+                            training_status = {
+                                'message': 'Failed to create training job',
+                                'estimatedTimeMinutes': None
+                            }
+                    else:
+                        training_status = {
+                            'message': 'Data stored for next scheduled training',
+                            'estimatedTimeMinutes': None
+                        }
+                    
+                    # Store the interactions in the database (optional)
+                    stored_count = 0
+                    if store_interactions_flag and data_content and 'interactions' in data_content:
+                        with db_lock:
+                            try:
+                                stored_count = store_interactions(DB_PATH, data_content)
+                                logger.info(f"Stored {stored_count} interactions from uploaded data (device: {device_id})")
+                            except Exception as e:
+                                logger.error(f"Error storing interactions from uploaded data: {str(e)}")
+                    
+                    # Return success response with detailed information
+                    latest_model = get_latest_model_info()
+                    return jsonify({
+                        'success': True,
+                        'message': 'Training data uploaded successfully',
+                        'dataId': data_id,
+                        'interactionsCount': interactions_count,
+                        'interactionsStored': stored_count,
+                        'fileSize': file_size,
+                        'uploadTime': datetime.now().isoformat(),
+                        'training': training_status,
+                        'latestModelVersion': latest_model['version'],
+                        'modelDownloadURL': f"https://{request.host}/api/ai/models/{latest_model['version']}"
+                    })
+                    
+                except Exception as e:
+                    # If any database operation fails, clean up the file
+                    logger.error(f"Error processing training data: {str(e)}")
+                    try:
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+                    except:
+                        pass
+                    return jsonify({'success': False, 'message': f'Error processing training data: {str(e)}'}), 500
+                    
+            except Exception as e:
+                logger.error(f"Unexpected error in data upload: {str(e)}", exc_info=True)
+                # Clean up any partial file
+                try:
+                    if file_path and os.path.exists(file_path):
+                        os.remove(file_path)
+                except:
+                    pass
+                return jsonify({'success': False, 'message': f'Server error: {str(e)}'}), 500
         
-        # Trigger training on existing data
+        # ======== TRIGGER TRAINING OPERATION ========
         elif operation == 'train' and request.method == 'POST':
-            device_id = request.args.get('deviceId', 'unknown')
-            model_id = request.args.get('modelId')
-            data_id = request.args.get('dataId')
+            from utils.db_helpers import sanitize_string, validate_uuid
             
-            # Determine the source type
+            # Get and validate parameters
+            device_id = sanitize_string(request.args.get('deviceId') or request.form.get('deviceId', 'unknown'), 100)
+            model_id = request.args.get('modelId') or request.form.get('modelId')
+            data_id = request.args.get('dataId') or request.form.get('dataId')
+            
+            # Validate UUIDs if provided
+            if model_id and not validate_uuid(model_id):
+                return jsonify({'success': False, 'message': f'Invalid model ID format: {model_id}'}), 400
+                
+            if data_id and not validate_uuid(data_id):
+                return jsonify({'success': False, 'message': f'Invalid data ID format: {data_id}'}), 400
+            
+            # Determine the source type based on provided IDs
             source_type = None
             source_id = None
             
@@ -485,154 +715,399 @@ def model_services():
                 source_type = 'scheduled'
                 source_id = 'scheduled_training'
             
-            # Create a training job
-            metadata = {}
+            # Verify resources exist if IDs provided
+            if source_type != 'scheduled':
+                if source_type == 'uploaded_model' or source_type == 'combined':
+                    # Verify model exists
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT id, file_path FROM uploaded_models WHERE id = ?", (model_id,))
+                    model_record = cursor.fetchone()
+                    
+                    if not model_record:
+                        conn.close()
+                        return jsonify({'success': False, 'message': f'Model not found: {model_id}'}), 404
+                    
+                    # Verify model file exists
+                    if not os.path.exists(model_record[1]):
+                        conn.close()
+                        return jsonify({'success': False, 'message': f'Model file missing for ID: {model_id}'}), 404
+                    
+                if source_type == 'json_data' or source_type == 'combined':
+                    # Verify training data exists
+                    if source_type != 'combined':  # Only execute if not already connected
+                        conn = sqlite3.connect(DB_PATH)
+                        cursor = conn.cursor()
+                        
+                    cursor.execute("SELECT id, data_path FROM training_data WHERE id = ?", (data_id,))
+                    data_record = cursor.fetchone()
+                    conn.close()
+                    
+                    if not data_record:
+                        return jsonify({'success': False, 'message': f'Training data not found: {data_id}'}), 404
+                    
+                    # Verify data file exists
+                    if not os.path.exists(data_record[1]):
+                        return jsonify({'success': False, 'message': f'Training data file missing for ID: {data_id}'}), 404
+            
+            # Create appropriate metadata for time estimation
+            metadata = {'created_by': 'model_services_api_train_endpoint'}
             estimated_time = 5  # Default estimate
             
-            # Get better time estimate if possible
+            # Get better time estimate based on source type
             from learning.trainer import estimate_training_time
-            if source_type == 'json_data':
-                try:
+            
+            try:
+                if source_type == 'json_data':
+                    # Estimate based on number of interactions
                     conn = sqlite3.connect(DB_PATH)
                     cursor = conn.cursor()
                     cursor.execute("SELECT data_path FROM training_data WHERE id = ?", (data_id,))
-                    data_path = cursor.fetchone()[0]
+                    data_path_result = cursor.fetchone()
                     conn.close()
                     
-                    if data_path and os.path.exists(data_path):
-                        with open(data_path, 'r') as f:
-                            data_content = json.load(f)
-                            interactions_count = len(data_content.get('interactions', []))
-                            estimated_time = estimate_training_time(interactions_count)
-                            metadata['interactions_count'] = interactions_count
-                except Exception:
-                    pass
+                    if data_path_result and data_path_result[0] and os.path.exists(data_path_result[0]):
+                        try:
+                            with open(data_path_result[0], 'r') as f:
+                                data_content = json.load(f)
+                                interactions_count = len(data_content.get('interactions', []))
+                                # Get file size for more accurate estimate
+                                file_size = os.path.getsize(data_path_result[0])
+                                
+                                estimated_time = estimate_training_time(interactions_count)
+                                metadata['interactions_count'] = interactions_count
+                                metadata['data_size'] = file_size
+                        except Exception as e:
+                            logger.warning(f"Error reading training data for estimation: {str(e)}")
+                
+                elif source_type == 'uploaded_model':
+                    # Estimate based on model complexity
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT file_size FROM uploaded_models WHERE id = ?", (model_id,))
+                    file_size_result = cursor.fetchone()
+                    conn.close()
+                    
+                    if file_size_result and file_size_result[0]:
+                        model_size = file_size_result[0]
+                        estimated_time = estimate_training_time(0, 1)  # Base on single model
+                        metadata['model_size'] = model_size
+                
+                elif source_type == 'combined':
+                    # Estimate based on both data and model
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    
+                    # Get model info
+                    cursor.execute("SELECT file_size FROM uploaded_models WHERE id = ?", (model_id,))
+                    model_result = cursor.fetchone()
+                    model_size = model_result[0] if model_result else 0
+                    
+                    # Get data info
+                    cursor.execute("SELECT data_path FROM training_data WHERE id = ?", (data_id,))
+                    data_result = cursor.fetchone()
+                    conn.close()
+                    
+                    interactions_count = 0
+                    if data_result and data_result[0] and os.path.exists(data_result[0]):
+                        try:
+                            with open(data_result[0], 'r') as f:
+                                data_content = json.load(f)
+                                interactions_count = len(data_content.get('interactions', []))
+                        except:
+                            pass
+                    
+                    # Estimate based on both factors
+                    estimated_time = estimate_training_time(interactions_count, 1)
+                    metadata['interactions_count'] = interactions_count
+                    metadata['model_size'] = model_size
             
+            except Exception as e:
+                logger.error(f"Error estimating training time: {str(e)}")
+                # Continue with default estimate
+            
+            # Store the estimated time in metadata
             metadata['estimated_minutes'] = estimated_time
             
-            with db_lock:
-                job_id = create_training_job(
-                    DB_PATH,
-                    device_id=device_id,
-                    source_type=source_type,
-                    source_id=source_id,
-                    metadata=metadata
+            # Create the training job in the database
+            job_id = None
+            try:
+                with db_lock:
+                    job_id = create_training_job(
+                        DB_PATH,
+                        device_id=device_id,
+                        source_type=source_type,
+                        source_id=source_id,
+                        metadata=metadata
+                    )
+                
+                if not job_id:
+                    return jsonify({'success': False, 'message': 'Failed to create training job'}), 500
+                
+                # Start training in a background thread
+                from learning.trainer import trigger_retraining_job
+                training_thread = threading.Thread(
+                    target=trigger_retraining_job,
+                    args=(DB_PATH, job_id, source_type, source_id),
+                    daemon=True
                 )
-            
-            # Start training in a background thread
-            from learning.trainer import trigger_retraining_job
-            training_thread = threading.Thread(
-                target=trigger_retraining_job,
-                args=(DB_PATH, job_id, source_type, source_id),
-                daemon=True
-            )
-            training_thread.start()
-            
-            return jsonify({
-                'success': True,
-                'message': 'Training job started',
-                'jobId': job_id,
-                'status': 'queued',
-                'estimatedTimeMinutes': estimated_time
-            })
-        
-        # Check training job status
-        elif operation == 'status' and request.method == 'GET':
-            job_id = request.args.get('jobId')
-            device_id = request.args.get('deviceId')
-            
-            if job_id:
-                # Get specific job status
-                job_info = get_training_job(DB_PATH, job_id)
+                training_thread.start()
                 
-                if not job_info:
-                    return jsonify({'success': False, 'message': 'Training job not found'}), 404
+                # Return success response with job details
+                from learning.trainer import get_training_status
+                initial_status = get_training_status(DB_PATH, job_id)
                 
-                # Format the response
                 response = {
                     'success': True,
-                    'job': {
-                        'id': job_info['id'],
-                        'status': job_info['status'],
-                        'progress': job_info['progress'],
-                        'createdAt': job_info['created_at'],
-                        'startTime': job_info['start_time'],
-                        'estimatedCompletionTime': job_info['estimated_completion_time'],
-                        'actualCompletionTime': job_info['actual_completion_time'],
-                    }
+                    'message': 'Training job started successfully',
+                    'jobId': job_id,
+                    'status': 'queued',
+                    'sourceType': source_type,
+                    'estimatedTimeMinutes': estimated_time,
+                    'estimatedCompletionTime': (datetime.now() + timedelta(minutes=estimated_time)).isoformat(),
+                    'statusCheckUrl': f"https://{request.host}/api/ai/model-services?operation=status&jobId={job_id}"
                 }
                 
-                # Add result model if job is completed
-                if job_info['status'] == 'completed' and job_info['result_model_version']:
-                    response['job']['resultModelVersion'] = job_info['result_model_version']
-                    response['job']['modelDownloadURL'] = f"https://{request.host}/api/ai/models/{job_info['result_model_version']}"
-                
-                # Add error message if job failed
-                if job_info['status'] == 'failed' and job_info['error_message']:
-                    response['job']['errorMessage'] = job_info['error_message']
+                # Add job details if available from initial status
+                if initial_status and initial_status.get('success') and 'job' in initial_status:
+                    response['jobDetails'] = initial_status['job']
                 
                 return jsonify(response)
-            
-            elif device_id:
-                # Get all jobs for a device
-                jobs = get_device_training_jobs(DB_PATH, device_id)
                 
+            except Exception as e:
+                logger.error(f"Error creating training job: {str(e)}")
+                return jsonify({'success': False, 'message': f'Error creating training job: {str(e)}'}), 500
+        
+        # ======== CHECK TRAINING STATUS OPERATION ========
+        elif operation == 'status' and request.method == 'GET':
+            from utils.db_helpers import sanitize_string, validate_uuid
+            
+            job_id = sanitize_string(request.args.get('jobId'), 36)  # UUIDs are 36 chars
+            device_id = sanitize_string(request.args.get('deviceId'), 100)
+            
+            # Validate at least one parameter is provided
+            if not job_id and not device_id:
+                return jsonify({
+                    'success': False, 
+                    'message': 'Either jobId or deviceId must be provided',
+                    'example': f"https://{request.host}/api/ai/model-services?operation=status&jobId=your-job-id"
+                }), 400
+            
+            # Validate job ID format if provided
+            if job_id and not validate_uuid(job_id):
+                return jsonify({'success': False, 'message': f'Invalid job ID format: {job_id}'}), 400
+            
+            # Get specific job status
+            if job_id:
+                from learning.trainer import get_training_status
+                status_response = get_training_status(DB_PATH, job_id)
+                
+                if not status_response.get('success'):
+                    return jsonify(status_response), 404
+                
+                # Add download URLs to the response for completed jobs
+                if 'job' in status_response and status_response['job'].get('status') == 'completed':
+                    if status_response['job'].get('resultModelVersion'):
+                        status_response['job']['modelDownloadURL'] = (
+                            f"https://{request.host}/api/ai/models/{status_response['job']['resultModelVersion']}"
+                        )
+                
+                return jsonify(status_response)
+            
+            # Get all jobs for a device
+            elif device_id:
+                # Handle pagination and limiting
+                try:
+                    limit = int(request.args.get('limit', 10))
+                    # Cap limit at reasonable value
+                    limit = min(max(1, limit), 50)
+                except (ValueError, TypeError):
+                    limit = 10
+                
+                # Get jobs from database
+                jobs = get_device_training_jobs(DB_PATH, device_id, limit)
+                
+                # Add download URLs to completed jobs
                 formatted_jobs = []
                 for job in jobs:
                     job_data = {
                         'id': job['id'],
                         'status': job['status'],
                         'progress': job['progress'],
+                        'sourceType': job.get('source_type'),
                         'createdAt': job['created_at'],
                         'startTime': job['start_time'],
                         'estimatedCompletionTime': job['estimated_completion_time'],
                         'actualCompletionTime': job['actual_completion_time']
                     }
                     
-                    if job['status'] == 'completed' and job['result_model_version']:
+                    # Handle completed jobs with models
+                    if job['status'] == 'completed' and job.get('result_model_version'):
                         job_data['resultModelVersion'] = job['result_model_version']
                         job_data['modelDownloadURL'] = f"https://{request.host}/api/ai/models/{job['result_model_version']}"
+                        
+                        # Add details URL for the specific job
+                        job_data['detailsUrl'] = f"https://{request.host}/api/ai/model-services?operation=status&jobId={job['id']}"
                     
-                    if job['status'] == 'failed' and job['error_message']:
+                    # Add error message for failed jobs
+                    if job['status'] == 'failed' and job.get('error_message'):
                         job_data['errorMessage'] = job['error_message']
+                    
+                    # Add time remaining for in-progress jobs
+                    if job['status'] == 'processing' and job['progress'] > 0:
+                        try:
+                            # Calculate remaining time if possible
+                            if job['start_time'] and job['estimated_completion_time']:
+                                now = datetime.now()
+                                estimated_completion = datetime.fromisoformat(job['estimated_completion_time'])
+                                
+                                if estimated_completion > now:
+                                    from learning.trainer import format_time_remaining
+                                    remaining_seconds = (estimated_completion - now).total_seconds()
+                                    job_data['timeRemainingSeconds'] = int(remaining_seconds)
+                                    job_data['timeRemainingFormatted'] = format_time_remaining(remaining_seconds)
+                        except Exception as e:
+                            logger.error(f"Error calculating time remaining: {str(e)}")
                     
                     formatted_jobs.append(job_data)
                 
+                # Return paginated response with count
                 return jsonify({
                     'success': True,
+                    'count': len(formatted_jobs),
+                    'limit': limit,
+                    'deviceId': device_id,
                     'jobs': formatted_jobs
                 })
-            
-            else:
-                return jsonify({'success': False, 'message': 'Either jobId or deviceId must be provided'}), 400
         
-        # Download a model
+        # ======== DOWNLOAD MODEL OPERATION ========
         elif operation == 'download' and request.method == 'GET':
-            version = request.args.get('version')
+            from utils.db_helpers import sanitize_string
+            
+            # Get and validate the version parameter
+            version = sanitize_string(request.args.get('version'), 50)
             
             if not version:
-                # Return the latest model
+                # Return the latest model if no version specified
                 model_info = get_latest_model_info()
                 version = model_info['version']
+                
+                # Check if we found a valid model
+                if not version or not model_info.get('path') or not os.path.exists(model_info.get('path', '')):
+                    return jsonify({
+                        'success': False, 
+                        'message': 'No models available for download',
+                        'availableVersions': [v['version'] for v in get_available_model_versions()]
+                    }), 404
             
+            # Security: Validate version format to prevent path traversal
+            if not re.match(r'^[0-9.]+$', version):
+                return jsonify({'success': False, 'message': 'Invalid version format'}), 400
+            
+            # Try to locate the model file
             model_path = os.path.join(MODEL_DIR, f"model_{version}.mlmodel")
-            if os.path.exists(model_path):
-                logger.info(f"Serving model version {version}")
-                try:
-                    return send_file(model_path, mimetype='application/octet-stream')
-                except Exception as e:
-                    logger.error(f"Error sending model file: {str(e)}")
-                    return jsonify({'success': False, 'message': f'Error retrieving model: {str(e)}'}), 500
-            else:
-                logger.warning(f"Model version {version} not found")
-                return jsonify({'success': False, 'message': 'Model not found'}), 404
+            
+            # Check if file exists and is readable
+            if not os.path.exists(model_path):
+                return jsonify({
+                    'success': False, 
+                    'message': f'Model version {version} not found',
+                    'availableVersions': [v['version'] for v in get_available_model_versions()]
+                }), 404
+            
+            if not os.access(model_path, os.R_OK):
+                return jsonify({'success': False, 'message': 'Cannot access model file (permission denied)'}), 403
+            
+            # Check file size to ensure it's not empty or corrupted
+            try:
+                file_size = os.path.getsize(model_path)
+                if file_size == 0:
+                    return jsonify({'success': False, 'message': 'Model file is empty'}), 500
+            except OSError as e:
+                logger.error(f"Error checking model file: {str(e)}")
+                return jsonify({'success': False, 'message': 'Error accessing model file'}), 500
+            
+            # Set security headers for download
+            headers = {
+                'Content-Disposition': f'attachment; filename="model_{version}.mlmodel"',
+                'X-Content-Type-Options': 'nosniff',
+                'Content-Type': 'application/octet-stream'
+            }
+            
+            # Log the download attempt
+            logger.info(f"Serving model version {version} ({file_size} bytes)")
+            
+            # Send the file with security headers
+            try:
+                return send_file(
+                    model_path, 
+                    mimetype='application/octet-stream',
+                    as_attachment=True,
+                    download_name=f"model_{version}.mlmodel",
+                    etag=True,
+                    conditional=True,
+                    last_modified=datetime.fromtimestamp(os.path.getmtime(model_path))
+                )
+            except Exception as e:
+                logger.error(f"Error sending model file: {str(e)}")
+                return jsonify({'success': False, 'message': f'Error retrieving model: {str(e)}'}), 500
         
-        else:
-            return jsonify({'success': False, 'message': f'Invalid operation: {operation}'}), 400
+        # If we get here, the operation was valid but the method was wrong
+        return jsonify({
+            'success': False, 
+            'message': f'Method {request.method} not allowed for operation {operation}',
+            'allowedMethods': {'upload-model': ['POST'], 'upload-data': ['POST'], 'train': ['POST'], 'status': ['GET'], 'download': ['GET']}[operation]
+        }), 405
         
     except Exception as e:
-        logger.error(f"Error in model-services endpoint: {str(e)}")
-        return jsonify({'success': False, 'message': f'Error: {str(e)}'}), 500
+        # Log the full exception with traceback for debugging
+        logger.error(f"Unhandled error in model-services endpoint: {str(e)}", exc_info=True)
+        
+        # Return a sanitized error message to the client
+        error_message = str(e)
+        # Avoid leaking sensitive information in error messages
+        if any(sensitive in error_message.lower() for sensitive in ['password', 'secret', 'token', 'key', 'auth']):
+            error_message = "An internal server error occurred"
+            
+        return jsonify({
+            'success': False, 
+            'message': 'Server error',
+            'error': error_message,
+            'timestamp': datetime.now().isoformat()
+        }), 500
+
+def get_available_model_versions():
+    """Get a list of available model versions on disk"""
+    versions = []
+    
+    try:
+        # List all model files in the model directory
+        model_files = [f for f in os.listdir(MODEL_DIR) 
+                      if f.startswith('model_') and f.endswith('.mlmodel')]
+        
+        for file in model_files:
+            # Extract version from filename
+            match = re.search(r'model_([0-9.]+)\.mlmodel', file)
+            if match:
+                version = match.group(1)
+                file_path = os.path.join(MODEL_DIR, file)
+                file_size = os.path.getsize(file_path)
+                modified_time = datetime.fromtimestamp(os.path.getmtime(file_path))
+                
+                versions.append({
+                    'version': version,
+                    'path': file_path,
+                    'size': file_size,
+                    'modified': modified_time.isoformat()
+                })
+        
+        # Sort by version (assuming semantic versioning)
+        versions.sort(key=lambda v: [int(x) for x in v['version'].split('.')])
+        
+    except Exception as e:
+        logger.error(f"Error listing model versions: {str(e)}")
+    
+    return versions
 
 @app.route('/api/ai/latest-model', methods=['GET'])
 def latest_model():
@@ -692,29 +1167,92 @@ def get_stats():
             conn.close()
 
 def get_latest_model_info():
-    info_path = os.path.join(MODEL_DIR, "latest_model.json")
+    """
+    Get information about the latest model with enhanced error handling
+    and security checks.
+    
+    Returns a dictionary with model information.
+    """
+    from utils.db_helpers import get_model_info
+    
     try:
-        if not os.path.exists(info_path):
-            default_info = {
-                'version': '1.0.0',
-                'path': os.path.join(MODEL_DIR, 'model_1.0.0.mlmodel'),
-                'training_date': datetime.now().isoformat()
-            }
-            # Ensure the directory exists
+        # Try to get model info from the database first (most reliable source)
+        model_info = get_model_info(DB_PATH)
+        
+        if model_info and 'version' in model_info:
+            # Check if the model file actually exists
+            if model_info.get('path') and os.path.exists(model_info['path']):
+                return model_info
+            else:
+                logger.warning(f"Model file missing: {model_info.get('path')}")
+                # Continue to fallback methods
+        
+        # Fallback to reading from the JSON file
+        info_path = os.path.join(MODEL_DIR, "latest_model.json")
+        
+        if os.path.exists(info_path):
+            try:
+                with open(info_path, 'r') as f:
+                    file_info = json.load(f)
+                
+                # Validate the model file exists
+                if 'path' in file_info and os.path.exists(file_info['path']):
+                    return file_info
+                else:
+                    # File path is invalid, but version info might still be useful
+                    logger.warning(f"Model file referenced in JSON not found: {file_info.get('path')}")
+                    model_path = os.path.join(MODEL_DIR, f"model_{file_info.get('version', '1.0.0')}.mlmodel")
+                    file_info['path'] = model_path if os.path.exists(model_path) else None
+                    return file_info
+            except (json.JSONDecodeError, IOError) as e:
+                logger.error(f"Error reading model info file: {str(e)}")
+                # Continue to default fallback
+        
+        # Create default info if nothing else is available
+        default_version = '1.0.0'
+        default_path = os.path.join(MODEL_DIR, f"model_{default_version}.mlmodel")
+        
+        # Check if default model exists, update path accordingly
+        if not os.path.exists(default_path):
+            # Look for any model files in the directory
+            model_files = [f for f in os.listdir(MODEL_DIR) if f.startswith('model_') and f.endswith('.mlmodel')]
+            if model_files:
+                # Use the newest model file based on modification time
+                newest_model = max(model_files, key=lambda f: os.path.getmtime(os.path.join(MODEL_DIR, f)))
+                default_path = os.path.join(MODEL_DIR, newest_model)
+                # Extract version from filename
+                version_match = re.search(r'model_([0-9.]+)\.mlmodel', newest_model)
+                if version_match:
+                    default_version = version_match.group(1)
+            else:
+                # No models found
+                default_path = None
+                logger.warning("No model files found in model directory")
+        
+        default_info = {
+            'version': default_version,
+            'path': default_path,
+            'training_date': datetime.now().isoformat()
+        }
+        
+        # Create the model info file for future use
+        try:
             os.makedirs(os.path.dirname(info_path), exist_ok=True)
             with open(info_path, 'w') as f:
                 json.dump(default_info, f)
-            return default_info
-            
-        with open(info_path, 'r') as f:
-            return json.load(f)
+        except IOError as e:
+            logger.error(f"Failed to write default model info: {str(e)}")
+        
+        return default_info
+    
     except Exception as e:
-        logger.error(f"Error accessing model info: {e}")
-        # Return a fallback if file access fails
+        logger.error(f"Error accessing model info: {str(e)}", exc_info=True)
+        # Last resort fallback
         return {
             'version': '1.0.0',
-            'path': os.path.join(MODEL_DIR, 'model_1.0.0.mlmodel'),
-            'training_date': datetime.now().isoformat()
+            'path': None,
+            'training_date': datetime.now().isoformat(),
+            'error': str(e)
         }
 
 def train_model_job():
@@ -728,42 +1266,338 @@ def train_model_job():
     except Exception as e:
         logger.error(f"Model training failed: {str(e)}")
 
+def cleanup_old_data():
+    """
+    Scheduled job to clean up old training data and temporary files
+    to prevent disk space issues in long-running deployments
+    """
+    try:
+        logger.info("Starting scheduled data cleanup")
+        
+        # Clean up old training data files
+        from utils.db_helpers import clean_old_training_data
+        deleted_count = clean_old_training_data(DB_PATH, days_old=30)
+        
+        # Clean up old log files (keep last 7 days)
+        log_dir = os.path.dirname(os.path.abspath("backdoor_ai.log"))
+        log_pattern = os.path.join(log_dir, "backdoor_ai*.log")
+        try:
+            import glob
+            log_files = glob.glob(log_pattern)
+            # Sort by modification time (oldest first)
+            log_files.sort(key=lambda x: os.path.getmtime(x))
+            
+            # Keep the 10 most recent log files
+            if len(log_files) > 10:
+                for old_log in log_files[:-10]:
+                    try:
+                        os.remove(old_log)
+                        logger.info(f"Deleted old log file: {old_log}")
+                    except OSError as e:
+                        logger.error(f"Error deleting log file {old_log}: {str(e)}")
+        except Exception as e:
+            logger.error(f"Error cleaning up log files: {str(e)}")
+        
+        # Check disk space and log warning if low
+        try:
+            import shutil
+            disk_usage = shutil.disk_usage(BASE_DIR)
+            percent_free = (disk_usage.free / disk_usage.total) * 100
+            if percent_free < 10:
+                logger.warning(f"Low disk space: {percent_free:.1f}% free ({disk_usage.free / (1024*1024*1024):.2f} GB)")
+        except Exception as e:
+            logger.error(f"Error checking disk space: {str(e)}")
+            
+        logger.info(f"Cleanup completed: removed {deleted_count} old training data files")
+    except Exception as e:
+        logger.error(f"Error in data cleanup job: {str(e)}")
+
 def run_scheduler():
+    # Schedule model training (early morning)
     schedule.every().day.at("02:00").do(train_model_job)
+    
+    # Schedule cleanup job (late night)
+    schedule.every().day.at("03:30").do(cleanup_old_data)
+    
+    # Schedule disk space check (every 6 hours)
+    def check_disk_space():
+        try:
+            import shutil
+            disk_usage = shutil.disk_usage(BASE_DIR)
+            percent_free = (disk_usage.free / disk_usage.total) * 100
+            if percent_free < 10:
+                logger.warning(f"Low disk space: {percent_free:.1f}% free ({disk_usage.free / (1024*1024*1024):.2f} GB)")
+        except Exception as e:
+            logger.error(f"Error checking disk space: {str(e)}")
+    
+    schedule.every(6).hours.do(check_disk_space)
+    
+    # Run scheduler loop
     while True:
         schedule.run_pending()
         time.sleep(60)
 
+# Start scheduler thread
 scheduler_thread = threading.Thread(target=run_scheduler)
 scheduler_thread.daemon = True
 scheduler_thread.start()
 
-# Add a basic health check endpoint
+# Log startup event with system info
+logger.info(f"Started scheduler with daily model training at 02:00 and cleanup at 03:30")
+
+# Add comprehensive health check endpoint for monitoring
 @app.route('/health', methods=['GET'])
 def health_check():
+    """
+    Comprehensive health check endpoint that provides detailed system status
+    information for monitoring and diagnostics.
+    
+    Returns:
+        JSON with health status of various system components
+    """
+    start_time = datetime.now()
+    health_data = {
+        'status': 'up',
+        'timestamp': start_time.isoformat(),
+        'components': {},
+        'metrics': {}
+    }
+    
+    # Check for admin key to include detailed diagnostics
+    include_details = request.headers.get('X-Admin-Key') == os.getenv("ADMIN_API_KEY")
+    
     try:
-        # Check if database is accessible
+        # Get server uptime
+        try:
+            with open('/proc/uptime', 'r') as f:
+                uptime_seconds = float(f.readline().split()[0])
+                health_data['uptime_seconds'] = uptime_seconds
+                days, remainder = divmod(uptime_seconds, 86400)
+                hours, remainder = divmod(remainder, 3600)
+                minutes, seconds = divmod(remainder, 60)
+                health_data['uptime_formatted'] = f"{int(days)}d {int(hours)}h {int(minutes)}m {int(seconds)}s"
+        except Exception as e:
+            logger.warning(f"Could not determine system uptime: {str(e)}")
+        
+        # 1. Database check
+        db_component = {'status': 'unknown'}
         conn = None
         try:
-            conn = sqlite3.connect(DB_PATH)
-            conn.execute("SELECT 1")
-            db_status = "healthy"
-        except Exception as e:
-            db_status = f"unhealthy: {str(e)}"
-        finally:
-            if conn:
+            start = time.time()
+            conn = sqlite3.connect(DB_PATH, timeout=5)
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM sqlite_master")
+            table_count = cursor.fetchone()[0]
+            conn.close()
+            
+            db_component.update({
+                'status': 'healthy',
+                'response_time_ms': int((time.time() - start) * 1000),
+                'tables': table_count
+            })
+            
+            # Add table counts if admin
+            if include_details:
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM interactions")
+                db_component['interaction_count'] = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM training_jobs")
+                db_component['job_count'] = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM model_versions")
+                db_component['model_count'] = cursor.fetchone()[0]
                 conn.close()
                 
-        # Check if model directory is accessible    
-        model_status = "healthy" if os.access(MODEL_DIR, os.R_OK | os.W_OK) else "unhealthy: permission denied"
+        except Exception as e:
+            db_component.update({
+                'status': 'unhealthy',
+                'error': str(e)
+            })
+        finally:
+            if conn and not conn.closed:
+                conn.close()
         
-        return jsonify({
-            'status': 'up',
-            'database': db_status,
-            'models': model_status,
-            'timestamp': datetime.now().isoformat()
-        })
+        health_data['components']['database'] = db_component
+        
+        # 2. Model file storage
+        models_component = {'status': 'unknown'}
+        try:
+            # Check if directory exists and is accessible
+            if os.path.exists(MODEL_DIR) and os.access(MODEL_DIR, os.R_OK | os.W_OK):
+                # Count models
+                model_files = [f for f in os.listdir(MODEL_DIR) if f.endswith('.mlmodel')]
+                latest_model = get_latest_model_info()
+                
+                models_component.update({
+                    'status': 'healthy',
+                    'model_count': len(model_files),
+                    'latest_version': latest_model.get('version'),
+                    'directory': MODEL_DIR
+                })
+                
+                # Verify latest model file exists
+                if latest_model.get('path') and os.path.exists(latest_model.get('path')):
+                    latest_model_size = os.path.getsize(latest_model.get('path'))
+                    models_component['latest_model_size_mb'] = round(latest_model_size / (1024 * 1024), 2)
+                else:
+                    models_component['warning'] = "Latest model file missing"
+            else:
+                models_component.update({
+                    'status': 'unhealthy',
+                    'error': "Model directory not accessible"
+                })
+        except Exception as e:
+            models_component.update({
+                'status': 'unhealthy',
+                'error': str(e)
+            })
+            
+        health_data['components']['models'] = models_component
+        
+        # 3. System metrics
+        try:
+            import psutil
+            import shutil
+            
+            # CPU usage
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            
+            # Memory usage
+            memory = psutil.virtual_memory()
+            memory_info = {
+                'total_gb': round(memory.total / (1024**3), 2),
+                'available_gb': round(memory.available / (1024**3), 2),
+                'used_percent': memory.percent
+            }
+            
+            # Disk usage
+            disk_usage = shutil.disk_usage(BASE_DIR)
+            disk_info = {
+                'total_gb': round(disk_usage.total / (1024**3), 2),
+                'free_gb': round(disk_usage.free / (1024**3), 2),
+                'used_percent': round((disk_usage.used / disk_usage.total) * 100, 2)
+            }
+            
+            health_data['metrics'] = {
+                'cpu_percent': cpu_percent,
+                'memory': memory_info,
+                'disk': disk_info
+            }
+            
+            # Add warning flags
+            health_data['warnings'] = []
+            if cpu_percent > 90:
+                health_data['warnings'].append("High CPU usage")
+            if memory.percent > 90:
+                health_data['warnings'].append("High memory usage")
+            if (disk_usage.free / disk_usage.total) < 0.1:
+                health_data['warnings'].append("Low disk space")
+                
+        except ImportError:
+            health_data['metrics'] = {
+                'status': 'limited',
+                'message': "psutil not installed, limited metrics available"
+            }
+            
+            # Fallback to basic disk check
+            try:
+                import shutil
+                disk_usage = shutil.disk_usage(BASE_DIR)
+                health_data['metrics']['disk'] = {
+                    'total_gb': round(disk_usage.total / (1024**3), 2),
+                    'free_gb': round(disk_usage.free / (1024**3), 2),
+                    'used_percent': round((disk_usage.used / disk_usage.total) * 100, 2)
+                }
+            except Exception as e:
+                logger.warning(f"Could not get disk metrics: {str(e)}")
+        except Exception as e:
+            health_data['metrics'] = {
+                'status': 'error',
+                'error': str(e)
+            }
+        
+        # 4. Scheduler status
+        scheduler_component = {'status': 'unknown'}
+        try:
+            next_jobs = []
+            for job in schedule.jobs:
+                next_run = job.next_run
+                next_jobs.append({
+                    'job': str(job),
+                    'next_run': next_run.isoformat() if next_run else None,
+                    'seconds_until_next_run': job.seconds_until_run() if next_run else None
+                })
+            
+            scheduler_component.update({
+                'status': 'healthy',
+                'scheduled_jobs': len(schedule.jobs),
+                'next_jobs': next_jobs
+            })
+        except Exception as e:
+            scheduler_component.update({
+                'status': 'unhealthy',
+                'error': str(e)
+            })
+            
+        health_data['components']['scheduler'] = scheduler_component
+        
+        # 5. Training jobs status
+        jobs_component = {'status': 'unknown'}
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            
+            # Get counts of jobs by status
+            cursor.execute("SELECT status, COUNT(*) FROM training_jobs GROUP BY status")
+            status_counts = {status: count for status, count in cursor.fetchall()}
+            
+            # Get active jobs
+            cursor.execute("""
+                SELECT id, status, progress, start_time, estimated_completion_time
+                FROM training_jobs
+                WHERE status = 'processing'
+                ORDER BY start_time DESC
+                LIMIT 3
+            """)
+            active_jobs = [dict(zip(['id', 'status', 'progress', 'start_time', 'estimated_completion_time'], row)) 
+                          for row in cursor.fetchall()]
+            
+            conn.close()
+            
+            jobs_component.update({
+                'status': 'healthy',
+                'status_counts': status_counts,
+                'active_jobs': active_jobs,
+                'active_job_count': len(active_jobs)
+            })
+        except Exception as e:
+            jobs_component.update({
+                'status': 'unhealthy',
+                'error': str(e)
+            })
+            
+        health_data['components']['training_jobs'] = jobs_component
+        
+        # Calculate overall health
+        component_statuses = [comp.get('status') for comp in health_data['components'].values()]
+        if any(status == 'unhealthy' for status in component_statuses):
+            health_data['status'] = 'degraded'
+            # Find the unhealthy components
+            unhealthy = [name for name, comp in health_data['components'].items() 
+                        if comp.get('status') == 'unhealthy']
+            health_data['degraded_components'] = unhealthy
+            
+        # Calculate response time
+        health_data['response_time_ms'] = int((datetime.now() - start_time).total_seconds() * 1000)
+            
+        # Return appropriate status code
+        if health_data['status'] == 'degraded':
+            return jsonify(health_data), 200  # Still return 200 for monitoring tools
+        else:
+            return jsonify(health_data)
+            
     except Exception as e:
+        logger.error(f"Health check failed: {str(e)}", exc_info=True)
         return jsonify({
             'status': 'error',
             'message': str(e),

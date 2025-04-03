@@ -590,28 +590,189 @@ def train_new_model(db_path, job_id=None, source_type=None, source_id=None, addi
         return get_current_model_version()
 
 def get_current_model_version():
+    """
+    Get the current model version from the latest_model.json file
+    with proper error handling and validation
+    """
     MODEL_DIR = os.path.join(os.getenv("RENDER_DISK_PATH", "/var/data"), "models")
     info_path = os.path.join(MODEL_DIR, "latest_model.json")
-    if os.path.exists(info_path):
+    
+    default_version = '1.0.0'
+    
+    try:
+        if not os.path.exists(info_path):
+            logger.warning(f"Model info file not found: {info_path}")
+            return default_version
+            
         with open(info_path, 'r') as f:
-            info = json.load(f)
-        return info.get('version', '1.0.0')
-    return '1.0.0'
+            try:
+                info = json.load(f)
+                version = info.get('version')
+                
+                # Validate version format (should be semantic versioning)
+                if version and re.match(r'^(\d+\.\d+\.\d+)$', version):
+                    return version
+                else:
+                    logger.warning(f"Invalid version format in model info: {version}")
+                    return default_version
+            except json.JSONDecodeError:
+                logger.error(f"Invalid JSON in model info file: {info_path}")
+                return default_version
+    except Exception as e:
+        logger.error(f"Error reading model info: {str(e)}")
+        return default_version
 
 def estimate_training_time(data_size, model_count=0):
     """
     Estimate training time in minutes based on data size and model count
+    
+    Parameters:
+    - data_size: Number of training records or file size in bytes
+    - model_count: Number of models to incorporate
+    
+    Returns:
+    - Estimated training time in minutes
     """
-    # Base time based on data size
+    # Validate inputs and set defaults
+    try:
+        data_size = int(data_size)
+    except (ValueError, TypeError):
+        data_size = 0
+        
+    try:
+        model_count = int(model_count)
+    except (ValueError, TypeError):
+        model_count = 0
+    
+    # Base time (minimum training time)
     base_minutes = 5
     
-    # Add time for data size
-    if data_size > 10000:  # 10k records
-        base_minutes += 10
-    elif data_size > 5000:  # 5k records
-        base_minutes += 5
+    # Scale based on data size - logarithmic scaling for larger datasets
+    if data_size > 0:
+        if data_size > 50000:  # Very large dataset (50k+ records)
+            data_minutes = 30 + (math.log10(data_size/50000) * 15)
+        elif data_size > 10000:  # Large dataset (10k-50k records)
+            data_minutes = 15 + ((data_size - 10000) / 5000)
+        elif data_size > 5000:  # Medium dataset (5k-10k records)
+            data_minutes = 8 + ((data_size - 5000) / 1000)
+        elif data_size > 1000:  # Small dataset (1k-5k records)
+            data_minutes = 5 + ((data_size - 1000) / 800)
+        else:  # Tiny dataset (<1k records)
+            data_minutes = max(2, data_size / 200)
+    else:
+        data_minutes = 0
     
-    # Add time for model count (each model adds processing time)
-    model_minutes = model_count * 2
+    # Scale based on model count - each model adds processing time
+    model_minutes = model_count * 3
     
-    return base_minutes + model_minutes
+    # Factor in machine learning operations
+    ml_minutes = 3  # Base time for ML operations
+    
+    # Sum all components and add a 20% buffer for safety
+    total_minutes = base_minutes + data_minutes + model_minutes + ml_minutes
+    total_minutes *= 1.2
+    
+    # Round to nearest minute and ensure reasonable bounds
+    total_minutes = max(3, min(round(total_minutes), 120))  # Cap at 2 hours
+    
+    logger.debug(f"Training time estimate: {total_minutes}min (data: {data_size}, models: {model_count})")
+    return int(total_minutes)
+    
+def get_training_status(db_path, job_id):
+    """
+    Get detailed training job status with additional metrics
+    
+    Parameters:
+    - db_path: Path to the database
+    - job_id: ID of the training job
+    
+    Returns:
+    - Dictionary with job status details
+    """
+    from utils.db_helpers import get_training_job
+    
+    try:
+        # Get basic job info
+        job_info = get_training_job(db_path, job_id)
+        
+        if not job_info:
+            return {'success': False, 'message': f'Training job not found: {job_id}'}
+        
+        # Enhance with additional information
+        result = {
+            'success': True,
+            'job': {
+                'id': job_info['id'],
+                'status': job_info['status'],
+                'progress': job_info['progress'],
+                'createdAt': job_info['created_at'],
+                'startTime': job_info['start_time'],
+                'estimatedCompletionTime': job_info['estimated_completion_time'],
+                'actualCompletionTime': job_info['actual_completion_time'],
+            }
+        }
+        
+        # Add time remaining calculation if job is in progress
+        if job_info['status'] == 'processing' and job_info['start_time'] and job_info['estimated_completion_time']:
+            try:
+                now = datetime.now()
+                estimated_completion = datetime.fromisoformat(job_info['estimated_completion_time'])
+                
+                # Calculate time remaining in seconds
+                if estimated_completion > now:
+                    time_remaining_seconds = (estimated_completion - now).total_seconds()
+                    result['job']['timeRemainingSeconds'] = int(time_remaining_seconds)
+                    result['job']['timeRemainingFormatted'] = format_time_remaining(time_remaining_seconds)
+                else:
+                    # If past estimated time but still processing
+                    result['job']['timeRemainingFormatted'] = "Finishing soon..."
+            except Exception as e:
+                logger.error(f"Error calculating time remaining: {str(e)}")
+        
+        # Add result model information if available
+        if job_info['status'] == 'completed' and job_info['result_model_version']:
+            result['job']['resultModelVersion'] = job_info['result_model_version']
+            
+            # Add model path if available
+            if 'model_path' in job_info and job_info['model_path']:
+                result['job']['modelPath'] = job_info['model_path']
+        
+        # Add error message if job failed
+        if job_info['status'] == 'failed' and job_info['error_message']:
+            result['job']['errorMessage'] = job_info['error_message']
+            
+        # Add source information
+        if job_info['source_type'] and job_info['source_id']:
+            result['job']['source'] = {
+                'type': job_info['source_type'],
+                'id': job_info['source_id']
+            }
+        
+        # Add metadata if available
+        if job_info.get('metadata') and isinstance(job_info['metadata'], dict):
+            result['job']['metadata'] = job_info['metadata']
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error getting training status: {str(e)}")
+        return {'success': False, 'message': f'Error getting training status: {str(e)}'}
+
+def format_time_remaining(seconds):
+    """Format seconds into a human-readable time string"""
+    if seconds < 60:
+        return f"{int(seconds)} seconds"
+    elif seconds < 3600:
+        minutes = int(seconds / 60)
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    else:
+        hours = int(seconds / 3600)
+        minutes = int((seconds % 3600) / 60)
+        if minutes == 0:
+            return f"{hours} hour{'s' if hours != 1 else ''}"
+        else:
+            return f"{hours} hour{'s' if hours != 1 else ''} and {minutes} minute{'s' if minutes != 1 else ''}"
+
+# Import math for logarithmic scaling in time estimation
+import math
+import re
